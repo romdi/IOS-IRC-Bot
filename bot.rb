@@ -818,7 +818,7 @@ def deserialize(chan)
   chan.schedule = chan_data['schedule']
   chan.schedule_players = chan_data['schedule_players']
   chan.lineup.positions.each_with_index {|pos, pos_index| pos.player = chan_data['positions'][pos_index] }
-  chan.subs = chan_data['subs']
+  chan.lineup.subs = chan_data['subs']
   chan_data['users'].each do |user_data|
     user = User.new(user_data['name'], user_data['role'])
     user.absent = true
