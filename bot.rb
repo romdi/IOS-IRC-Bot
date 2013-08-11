@@ -169,7 +169,7 @@ class Channel
       @against.nil? ? nil : " - vs - [" + StringIrc.new("Team: #{@against}").bold.to_s + "]"
     end
 
-    subs_text = @lineup.subs.size > 0 ? ' | ' + StringIrc.new(' [Subs: ' + @lineup.subs.map {|sub| sub.to_topic }.join(', ') + ']').bold.to_s : nil
+    subs_text = @lineup.subs.size > 0 ? ' | ' + StringIrc.new('[Subs: ' + @lineup.subs.map {|sub| sub.to_topic }.join(', ') + ']').bold.to_s : nil
 
     if @lineup.two_teams?
       text += against_text
@@ -368,10 +368,10 @@ class Channel
           send_chan_message(nil, text)
 
         when 'ips'
-          send_chan_message(nick, "IOS Server IPs: " + File.file?('server_ips.txt') ? File.read('server_ips.txt').split("\n").join(', ') : 'No server ips found.')
+          send_chan_message(nick, "IOS Server IPs: " + (File.file?('server_ips.txt') ? File.read('server_ips.txt').split("\n").join(', ') : 'No server IPs found.'))
 
-        when 'sites'
-          send_chan_message(nick, "IOS Websites: " + File.file?('websites.txt') ? File.read('websites.txt').split("\n").join(', ') : 'No websites found.')
+        when 'sites', 'websites'
+          send_chan_message(nick, "IOS Websites: " + (File.file?('websites.txt') ? File.read('websites.txt').split("\n").join(', ') : 'No websites found.'))
 
         when 'dnd'
           if params[0].nil? || params[0] == '0'
