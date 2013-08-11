@@ -14,6 +14,36 @@ require 'yaml'
 # Don't allow use of "tainted" data by potentially dangerous operations
 #$SAFE=1
 
+class Numeric
+  def to_time_ago
+    time_ago = self
+    time_unit = 'seconds'
+
+    if time_ago / 60 >= 1
+      time_ago /= 60
+      time_unit = time_ago == 1 ? 'minute' : 'minutes' 
+
+      if time_ago / 60 >= 1
+        time_ago /= 60
+        time_unit = time_ago == 1 ? 'hour' : 'hours'
+
+        if time_ago / 24 >= 1
+          time_ago /= 24
+          time_unit = time_ago == 1 ? 'day' : 'days'
+        end
+      end
+    end
+
+    "#{time_ago.round(1)} #{time_unit}"
+  end
+end
+
+class String
+  def to_topic
+    self[0..4]
+  end
+end
+
 class Position
   attr_accessor :name, :team, :signup_time
 
@@ -35,12 +65,13 @@ class Position
 end
 
 class Lineup
-  attr_accessor :pos_names, :positions, :player_count
+  attr_accessor :pos_names, :positions, :player_count, :subs
 
   def initialize(chan, player_count, two_teams)
     @chan = chan
     @player_count = player_count
     @two_teams = two_teams
+    @subs = []
 
     @pos_names =
     case @player_count
@@ -79,12 +110,14 @@ class Lineup
 end
 
 class User
-  attr_accessor :name, :role, :dnd_end
+  attr_accessor :name, :role, :dnd_end, :absent, :last_seen
 
   def initialize(name, role)
     @name = name
     @role = role
     @dnd_end = nil
+    @absent = false
+    @last_seen = nil
   end
 
   def op?
@@ -101,7 +134,7 @@ class User
 end
 
 class Channel
-  attr_accessor :name, :topic, :lineup, :against, :news, :users, :schedule, :schedule_players, :deserialized
+  attr_accessor :name, :topic, :lineup, :against, :news, :users, :schedule, :schedule_players
 
   def initialize(client, name, player_count, two_teams)
     @client = client
@@ -112,23 +145,22 @@ class Channel
     @users = {}
     @schedule = nil
     @schedule_players = []
-    @deserialized = false
+    @role_list_received = false
+    deserialize(self)
   end
 
   def topic
     pos_texts = @lineup.positions.each_slice(@lineup.player_count).map do |pos_set|
       pos_set.collect do |pos|
         if pos.player.nil?
-          #StringIrc.new(" #{pos.name.upcase} ").bold.to_s
           "[" + StringIrc.new("#{pos.name.upcase}").to_s + "]"
         else
-          #StringIrc.new(" #{pos.name.upcase}: #{pos.player.split('')[0..3].join('')} ").inverse.to_s
-          "[" + StringIrc.new("#{pos.name.upcase}: #{pos.player[0..4]}").bold.to_s + "]"
+          "[" + StringIrc.new("#{pos.name.upcase}: #{pos.player.to_topic}").bold.to_s + "]"
         end
       end.join(' ')
     end
 
-    text = "#{pos_texts[0]}"
+    text = pos_texts[0]
 
     against_text =
     if @lineup.two_teams?
@@ -137,13 +169,21 @@ class Channel
       @against.nil? ? nil : " - vs - [" + StringIrc.new("Team: #{@against}").bold.to_s + "]"
     end
 
-    text += against_text if against_text
+    subs_text = @lineup.subs.size > 0 ? ' | ' + StringIrc.new(' [Subs: ' + @lineup.subs.map {|sub| sub.to_topic }.join(', ') + ']').bold.to_s : nil
 
-    text += " || #{@schedule} - Avail.: #{@schedule_players.map {|player| player[0..4] }.join(', ')}" if @schedule
+    if @lineup.two_teams?
+      text += against_text
+      text += subs_text if subs_text
+    else
+      text += subs_text if subs_text
+      text += against_text if against_text
+    end
+
+    text += " || Schedule: #{@schedule} - Avail.: #{@schedule_players.map {|player| player.to_topic }.join(', ')}" if @schedule
 
     text += StringIrc.new(" || #{@news}").to_s if @news
 
-    text
+    text.strip
   end
 
   def poll_users
@@ -168,31 +208,29 @@ class Channel
 
       if @users[name]
         @users[name].role = role
+        @users[name].absent = false
       else
         @users[name] = User.new(name, role)
       end
     end
 
-    unless @deserialized
-      deserialize(self)
-      @deserialized = true
-    end
+    @role_list_received = true
 
     send_topic if @users[@client.nick].op? && (!was_op || old_topic != topic)
   end
 
   def add_user(name)
-    @users[name] = User.new(name, :normal)
+    if @users[name]
+      @users[name].absent = false
+    else
+      @users[name] = User.new(name, :normal)
+    end
   end
 
   def remove_user(name)
-    @users.delete(name)
-    pos = @lineup.positions.find {|pos| pos.player == name }
-
-    if pos
-      pos.player = nil
-      send_topic
-    end
+    return unless @users[name]
+    @users[name].absent = true
+    @users[name].last_seen = Time.now
   end
 
   def rename_user(old_nick, new_nick)
@@ -207,20 +245,27 @@ class Channel
     end
   end
 
-  def send_chan_message(msg)
-    @client.send_privmsg @name, msg
+  def send_chan_message(nick, msg)
+    @client.send_privmsg(@name, nick ? "#{nick}: #{msg}" : msg)
   end
 
   def send_topic
     if @users[@client.nick].op?
       @client.send "TOPIC #{@name} :#{topic}"
     else
-      send_chan_message("Error: I need to be operator to do my work.")
+      send_chan_message(nil, 'Error: I need to be operator to do my work.') if @role_list_received
     end
   end
 
-  def send_command_list
-    send_chan_message("Commands: !help, !<pos>, !remove [pos], !reset, !vs [team], !oneteam, !twoteams, !info <text>, !ready <server>, !dnd <duration<s|m|h>>, !whois <pos>, !schedule <info>, !available, !unavailable, !highlight, !sites, !files, !ips, !stats, !twitter. Use '/invite #{@client.nick} #yourchan' to invite me to your own channel.")
+  def send_command_list(nick)
+    msg = 
+    <<-eos
+      Commands: !help, !<pos>, !remove [pos], !reset, !vs [team], !oneteam, !twoteams, !info <text>, !ready <server>,
+      !dnd <duration<s|m|h>>, !whois <pos>, !schedule <info>, !sub, !unsub, !available, !unavailable, !highlight, !sites, !files, !ips,
+      !stats, !twitter, !teamspeak, !seen. Use '/invite #{@client.nick} #yourchan' to invite me to your own channel.
+    eos
+
+    send_chan_message(nick, msg)
   end
 
   def handle_message(nick, type, msg)
@@ -235,7 +280,7 @@ class Channel
 
         case cmd
         when 'help', 'commands', 'cmds'
-          send_command_list
+          send_command_list(nick)
         
         when *(@lineup.pos_names + %w(1 2).map {|n| @lineup.pos_names.map {|pos_name| pos_name + n } }.flatten)
           player = params[0] || nick
@@ -247,21 +292,21 @@ class Channel
           end
 
           if wishpos
-            if wishpos.player
-              if wishpos.player == nick
-                send_chan_message("#{nick}: The position is already taken by you.")
+            if wishpos.player || wishpos.team == 2 && !@lineup.two_teams?
+              if wishpos.player && wishpos.player.to_topic == nick.to_topic
+                send_chan_message(nick, 'The position is already taken by you.')
               else
-                send_chan_message("#{nick}: The position is already taken.")
+                send_chan_message(nick, 'The position is already taken by another player.')
               end
             else
-              oldpos = @lineup.positions.find {|pos| pos.player == player }
+              oldpos = @lineup.positions.find {|pos| pos.player && pos.player.to_topic == player.to_topic }
               oldpos.player = nil if oldpos
               wishpos.player = player
             end
           else
-            send_chan_message("#{nick}: Position not found.")
+            send_chan_message(nick, 'Position not found.')
           end
-        
+
         when 'remove', 'delete'
           pos = nil
           pos_name_or_player = params[0]
@@ -269,19 +314,20 @@ class Channel
           if pos_name_or_player
             pos_name_or_player.downcase!
             pos = @lineup.positions.find {|pos| [pos.name, pos.name + pos.team.to_s].include?(pos_name_or_player) }
-            pos = @lineup.positions.find {|pos| pos.player == pos_name_or_player } if pos.nil?
+            pos = @lineup.positions.find {|pos| pos.player && pos.player.to_topic == pos_name_or_player.to_topic } if pos.nil?
           else
-            pos = @lineup.positions.find {|pos| pos.player == nick }
+            pos = @lineup.positions.find {|pos| pos.player && pos.player.to_topic == nick.to_topic }
           end
 
           if pos
             pos.player = nil
           else
-            send_chan_message("#{nick}: position or player not found.")
+            send_chan_message(nick, 'Position or player not found.')
           end
         
         when 'reset', 'clear', 'empty'
           @lineup.positions.each {|p| p.player = nil }
+          @lineup.subs.clear
           @against = nil
         
         when 'vs', 'against', 'opponent'
@@ -294,7 +340,7 @@ class Channel
             @news = params.join(' ')
             @news = nil if @news == ''
           else
-            send_chan_message('Error: You have to be operator for this command')
+            send_chan_message(nick, 'You have to be operator to use this command')
           end
 
         when 'twoteams'
@@ -304,61 +350,54 @@ class Channel
           @lineup.two_teams = false
 
         when 'ready'
-          text = "Go to server #{params.join(' ')}: " + @lineup.positions.collect {|pos| pos.player }.compact.join(', ')
-          send_chan_message(StringIrc.new(text).bold.to_s)
+          text = "Go to server #{params.join(' ')}: " + @lineup.positions.collect {|pos| pos.player }.compact.join(', ') + "."
+          text += " Subs: #{@lineup.subs.join(', ')}" if @lineup.subs.size > 0
+          send_chan_message(nil, StringIrc.new(text).bold.to_s)
 
         when 'highlight'
-          empty_positions = @lineup.positions.collect do |pos|
-            if pos.player.nil?
-              (pos.name + (@lineup.two_teams? ? pos.team.to_s : '')).upcase
-            else
-              nil
-            end
-          end.compact.join(', ')
-
           unsigned_users = @users.collect do |user_name, user|
+            next nil if user.absent
             next nil if user.dnd?
             next nil if ['Q', @client.nick].include?(user.name)
             next nil if @lineup.positions.any? {|pos| pos.player == user.name }
+            next nil if @lineup.subs.include?(user.name)
             user.name
           end.compact.join(', ')
 
-          #text = "Please sign in for #{empty_positions}: #{unsigned_users}"
           text = "Please sign in: #{unsigned_users}." + StringIrc.new(" Use '!dnd <duration<s|m|h>>' to remove you from this list temporarily.").bold.to_s
-          send_chan_message(text)
+          send_chan_message(nil, text)
 
         when 'ips'
-          send_chan_message("IOS Server IPs: " + File.file?('server_ips.txt') ? File.read('server_ips.txt').split("\n").join(', ') : 'No server ips found.')
+          send_chan_message(nick, "IOS Server IPs: " + File.file?('server_ips.txt') ? File.read('server_ips.txt').split("\n").join(', ') : 'No server ips found.')
 
         when 'sites'
-          send_chan_message("IOS Websites: " + File.file?('websites.txt') ? File.read('websites.txt').split("\n").join(', ') : 'No websites found.')
+          send_chan_message(nick, "IOS Websites: " + File.file?('websites.txt') ? File.read('websites.txt').split("\n").join(', ') : 'No websites found.')
 
         when 'dnd'
           if params[0].nil? || params[0] == '0'
             @users[nick].dnd_end = nil
-            send_chan_message("#{nick}: Your dnd status has been reset.")
+            send_chan_message(nick, "Your dnd status has been reset.")
           elsif params.join(' ') =~ /^ (?<duration> \d+\.?\d*) \s? (?<unit> (s|m|h)) /xi
-            if $~[:duration] && $~[:unit]
-              duration = $~[:duration].to_f
-              unit = ''
+            duration = $~[:duration].to_f
+            unit = ''
 
-              case $~[:unit]
-              when *%w(s second seconds)
-                unit = duration == 1 ? 'second' : 'seconds'
-              when *%w(m minute minutes)
-                unit = duration == 1 ? 'minute' : 'minutes'
-                duration *= 60
-              when *%w(h hour hours)
-                unit = duration == 1 ? 'hour' : 'hours'
-                duration *= 60 * 60
-              end
-
-              @users[nick].dnd_end = Time.now + duration
-              send_chan_message("#{nick}: Excluding you from highlighting for #{$~[:duration]} #{unit}. Reset with '!dnd'.")
-            else
-              send_chan_message("#{nick}: Invalid dnd syntax.")
+            case $~[:unit]
+            when *%w(s second seconds)
+              unit = duration == 1 ? 'second' : 'seconds'
+            when *%w(m minute minutes)
+              unit = duration == 1 ? 'minute' : 'minutes'
+              duration *= 60
+            when *%w(h hour hours)
+              unit = duration == 1 ? 'hour' : 'hours'
+              duration *= 60 * 60
             end
+
+            @users[nick].dnd_end = Time.now + duration
+            send_chan_message(nick, "Excluding you from highlighting for #{$~[:duration]} #{unit}. Reset with '!dnd'.")
+          else
+            send_chan_message(nick, "Invalid dnd syntax.")
           end
+
         when 'who', 'whois'
           pos = @lineup.positions.find do |pos|
             [pos.name, pos.name + pos.team.to_s].include?(params[0])
@@ -368,8 +407,8 @@ class Channel
 
           if pos
             if pos.player
-              minutes = ((Time.now - pos.signup_time) / 60).ceil
-              text = "'#{pos.player[0..4]}' is '#{pos.player}' who signed up #{minutes} #{minutes ==  1 ? 'minute' : 'minutes'} ago."
+              time_ago = (Time.now - pos.signup_time).to_time_ago
+              text = "'#{pos.player.to_topic}' is '#{pos.player}' who signed up #{time_ago} ago."
             else
               text = "No player on this position."
             end
@@ -377,7 +416,7 @@ class Channel
               text = "Unknown position."
           end
 
-          send_chan_message("#{nick}: #{text}")
+          send_chan_message(nick, text)
 
         when 'stats'
           users = @client.chans.collect do |chan_name, chan|
@@ -390,7 +429,7 @@ class Channel
             end.compact
           end.flatten.uniq
 
-          send_chan_message("I'm currently in #{@client.chans.size} channels serving #{users.size} unique users.")
+          send_chan_message(nick, "I'm currently in #{@client.chans.size} channels serving #{users.size} unique users.")
 
         when 'twitter'
           tweets = Nokogiri::HTML(open("https://twitter.com/IOS_Insider")).css('.stream-item .content').map do |content|
@@ -398,48 +437,96 @@ class Channel
           end
 
           tweet = tweets[0][1]
-          time_ago = Time.now - tweets[0][0]
-          time_unit = 'seconds'
+          time_ago = (Time.now - tweets[0][0]).to_time_ago
 
-          if time_ago / 60 >= 1
-            time_ago /= 60
-            time_unit = time_ago == 1 ? 'minute' : 'minutes' 
+          send_chan_message(nick, "IOS-Insider #{time_ago} ago: " + StringIrc.new(tweet).bold.to_s + " (https://twitter.com/IOS_Insider)")
 
-            if time_ago / 60 >= 1
-              time_ago /= 60
-              time_unit = time_ago == 1 ? 'hour' : 'hours'
+        when 'files', 'update', 'download'
+          send_chan_message(nick, 'How to install: https://github.com/romdi/IOS || Game package: https://dl.dropboxusercontent.com/u/14644518/iosoccer.7z || Changelog: https://github.com/romdi/IOS/commits/master')
 
-              if time_ago / 24 >= 1
-                time_ago /= 24
-                time_unit = time_ago == 1 ? 'day' : 'days'
-              end
-            end
-          end
-
-          send_chan_message("IOS-Insider #{time_ago.round(1)} #{time_unit} ago: " + StringIrc.new(tweet).bold.to_s + " (https://twitter.com/IOS_Insider)")
-
-        when 'files', 'update'
-          send_chan_message("How to install: https://github.com/romdi/IOS || Game package: https://dl.dropboxusercontent.com/u/14644518/iosoccer.7z || Changelog: https://github.com/romdi/IOS/commits/master")
+        when 'teamspeak', 'ts'
+          send_chan_message(nick, 'IOS Teamspeak Server: ts3server://teamspeak.iosoccer.com')
 
         when 'schedule'
           @schedule = params.join(' ')
-          @schedule = nil if @schedule == ''
+
+          if @schedule == ''
+            @schedule = nil
+            @schedule_players.clear
+          end
 
         when 'available'
-          player = params[0] || nick
-          @schedule_players << player[0..4] unless @schedule_players.include?(player[0..4])
+          if @schedule
+            player = params[0] || nick
+
+            if @schedule_players.any? {|schedule_player| schedule_player.to_topic == player.to_topic }
+              send_chan_message(nick, "#{params[0] ? "#{player} is" : 'You are'} already in the list.")
+            else
+              @schedule_players << player
+            end
+          else
+            send_chan_message(nick, "No schedule set.")
+          end
 
         when 'unavailable'
-          player = params[0] || nick
-          @schedule_players.delete(player[0..4])
+          if @schedule
+            player = params[0] || nick
+            schedule_player = @schedule_players.find {|schedule_player| schedule_player.to_topic == player.to_topic }
 
+            if schedule_player
+              @schedule_players.delete(schedule_player)
+            else
+              send_chan_message(nick, "#{params[0] ? "#{player} is" : 'You are'} not in the list.")
+            end
+          else
+            send_chan_message(nick, "No schedule set.")
+          end
+
+        when 'sub'
+          player = params[0] || nick
+          
+          if @lineup.subs.any? {|sub| sub.to_topic == player.to_topic }
+            send_chan_message(nick, "#{params[0] ? "#{player} is" : 'You are'} already in the list.")
+          else
+            @lineup.subs << player
+          end
+
+        when 'unsub'
+          player = params[0] || nick
+          sub = @lineup.subs.find {|sub| sub.to_topic == player.to_topic }
+
+          if sub
+            @lineup.subs.delete(sub)
+          else
+            send_chan_message(nick, "#{params[0] ? "#{player} is" : 'You are'} not in the list.")
+          end
+
+        when 'seen'
+          player = params[0]
+
+          if player
+            msg =
+            if @users[player]
+              if @users[player].absent
+                "was last seen #{(Time.now - @users[player].last_seen).to_time_ago} ago"
+              else
+                "is here right now"
+              end
+            else
+              "hasn't been seen yet"
+            end
+
+            send_chan_message(nick, "#{player} #{msg}.")
+          else
+            send_chan_message(nick, 'Seen whom?')
+          end
         end
       else
         URI.extract(msg, ['http', 'https']).each do |url|
           if Net::HTTP.get(URI(url)) =~ /<title>(?<title> .*?)<\/title>/xi
             title = $~[:title].force_encoding("UTF-8").strip
             title = HTMLEntities.new.decode(title)
-            send_chan_message("Title: #{title}")
+            send_chan_message(nil, "Title: #{title}")
           end
         end
       end
@@ -451,7 +538,7 @@ class Channel
     #:Kaim!~Kaim@62.43.91.162.dyn.user.ono.com JOIN #ios.mix
     when 'JOIN'
       add_user(nick)
-      send_command_list if nick == @client.nick
+      send_command_list(nil) if nick == @client.nick
 
     #:romdi!~Roman@nrbg-4dbe2fee.pool.mediaWays.net PART #ios.foo :Leaving
     when 'PART'
@@ -508,7 +595,7 @@ class IRCClient
   end
 
   def log(msg)
-    puts msg.strip
+    puts Time.now.strftime("%d/%m/%Y %H:%M:%S: #{msg.strip}")
     logger.info msg.strip
   end
 
@@ -731,7 +818,14 @@ def deserialize(chan)
   chan.schedule = chan_data['schedule']
   chan.schedule_players = chan_data['schedule_players']
   chan.lineup.positions.each_with_index {|pos, pos_index| pos.player = chan_data['positions'][pos_index] }
-  chan_data['dnd_ends'].each {|user_name, dnd_end| chan.users[user_name].dnd_end = dnd_end if chan.users[user_name] }
+  chan.subs = chan_data['subs']
+  chan_data['users'].each do |user_data|
+    user = User.new(user_data['name'], user_data['role'])
+    user.absent = true
+    user.dnd_end = user_data['dnd_end']
+    user.last_seen = user_data['last_seen']
+    chan.users[user.name] = user
+  end
 end
 
 def serialize
@@ -746,8 +840,17 @@ def serialize
     chan_data['schedule'] = chan.schedule
     chan_data['schedule_players'] = chan.schedule_players
     chan_data['positions'] = chan.lineup.positions.collect {|pos| pos.player }
-    chan_data['dnd_ends'] = {}
-    chan.users.each_value {|user| chan_data['dnd_ends'][user.name] = user.dnd_end if user.dnd_end }
+    chan_data['subs'] = chan.lineup.subs
+    chan_data['users'] = []
+    chan.users.each_value do |user|
+      user.last_seen = Time.now unless user.absent
+      user_data = {}
+      user_data['name'] = user.name
+      user_data['role'] = user.role
+      user_data['dnd_end'] = user.dnd_end
+      user_data['last_seen'] = user.last_seen
+      chan_data['users'] << user_data
+    end
 
     data[chan.name] = chan_data
   end
